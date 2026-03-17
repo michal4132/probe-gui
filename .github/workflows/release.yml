@@ -73,9 +73,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: probe-gui-${{ matrix.label }}
-          path: |
-            probe-gui/src-tauri/target/release/bundle/dmg/*.dmg
-            probe-gui/src-tauri/target/release/bundle/macos/*.app
+          path: probe-gui/src-tauri/target/release/bundle/dmg/*.dmg
 
       - name: Upload Linux artifacts
         if: runner.os == 'Linux'
@@ -91,9 +89,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: probe-gui-${{ matrix.label }}
-          path: |
-            probe-gui/src-tauri/target/release/bundle/nsis/*.exe
-            probe-gui/src-tauri/target/release/probe-gui.exe
+          path: probe-gui/src-tauri/target/release/probe-gui.exe
 
   release:
     runs-on: ubuntu-latest
@@ -110,4 +106,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*
+          files: |
+            artifacts/**/*.dmg
+            artifacts/**/*.AppImage
+            artifacts/**/*.deb
+            artifacts/**/probe-gui.exe
