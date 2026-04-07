@@ -179,6 +179,7 @@
 
   select, input {
     flex: 1;
+    min-width: 0;
     padding: 9px 12px;
     background: rgba(255, 255, 255, 0.06);
     border: 1px solid rgba(255, 255, 255, 0.1);
@@ -187,6 +188,8 @@
     font-size: 13px;
     font-family: inherit;
     transition: border-color 0.15s;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   select:focus, input:focus {
