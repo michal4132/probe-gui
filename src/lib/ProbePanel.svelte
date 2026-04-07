@@ -7,8 +7,11 @@
   let chips = $state([]);
   let chipFilter = $state('');
   let selectedProbe = $state(0);
-  let selectedChip = $state('');
+  let selectedChip = $state(localStorage.getItem('lastChip') || '');
   let loading = $state(false);
+
+  // Initialize filter from saved chip
+  if (selectedChip) chipFilter = selectedChip;
 
   async function refreshProbes() {
     try {
@@ -36,6 +39,7 @@
         probeIndex: selectedProbe,
         chip,
       });
+      if (selectedChip) localStorage.setItem('lastChip', selectedChip);
       onconnected?.({ detail: target });
     } catch (e) {
       onstatus?.({ detail: `Connection failed: ${e}` });
