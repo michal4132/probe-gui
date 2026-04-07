@@ -55,12 +55,14 @@
     color: #f5f5f7;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+    overflow: hidden;
   }
 
   main {
     display: flex;
     flex-direction: column;
     height: 100vh;
+    overflow: hidden;
   }
 
   .panels {
