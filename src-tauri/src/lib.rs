@@ -9,7 +9,9 @@ use probe_rs::{Permissions, Session};
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::path::PathBuf;
-use tauri::State;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tauri::{Emitter, State};
 
 // ── Types for the frontend ──────────────────────────────────────────────────
 
@@ -42,6 +44,12 @@ pub struct RttChannelInfo {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct RttAttachResult {
+    pub channels: Vec<RttChannelInfo>,
+    pub control_block_address: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct FlashProgress {
     pub phase: String,
     pub progress: f64,
@@ -51,8 +59,9 @@ pub struct FlashProgress {
 // ── App state ───────────────────────────────────────────────────────────────
 
 pub struct AppState {
-    session: Mutex<Option<Session>>,
-    rtt: Mutex<Option<RttState>>,
+    session: Arc<Mutex<Option<Session>>>,
+    rtt: Arc<Mutex<Option<RttState>>>,
+    rtt_stop: Arc<AtomicBool>,
 }
 
 struct RttState {
@@ -64,8 +73,9 @@ struct RttState {
 impl AppState {
     pub fn new() -> Self {
         Self {
-            session: Mutex::new(None),
-            rtt: Mutex::new(None),
+            session: Arc::new(Mutex::new(None)),
+            rtt: Arc::new(Mutex::new(None)),
+            rtt_stop: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -127,6 +137,7 @@ fn connect(
 
 #[tauri::command]
 fn disconnect(state: State<'_, AppState>) {
+    state.rtt_stop.store(true, Ordering::Relaxed);
     *state.rtt.lock() = None;
     *state.session.lock() = None;
 }
@@ -164,37 +175,42 @@ fn flash_firmware(
 #[tauri::command]
 fn rtt_attach(
     state: State<'_, AppState>,
+    app: tauri::AppHandle,
     up_channel: Option<usize>,
     down_channel: Option<usize>,
     scan_region: Option<String>,
-) -> Result<Vec<RttChannelInfo>, String> {
-    let mut session_guard = state.session.lock();
-    let session = session_guard
-        .as_mut()
-        .ok_or("Not connected to a probe")?;
+) -> Result<RttAttachResult, String> {
+    let (rtt, channels) = {
+        let mut session_guard = state.session.lock();
+        let session = session_guard
+            .as_mut()
+            .ok_or("Not connected to a probe")?;
 
-    let mut core = session.core(0).map_err(|e| format!("Failed to get core: {e}"))?;
+        let mut core = session.core(0).map_err(|e| format!("Failed to get core: {e}"))?;
 
-    let region = if let Some(ref region_str) = scan_region {
-        parse_scan_region(region_str).map_err(|e| format!("Invalid scan region: {e}"))?
-    } else {
-        ScanRegion::Ram
-    };
+        let region = if let Some(ref region_str) = scan_region {
+            parse_scan_region(region_str).map_err(|e| format!("Invalid scan region: {e}"))?
+        } else {
+            ScanRegion::Ram
+        };
 
-    let mut rtt = Rtt::attach_region(&mut core, &region)
-        .map_err(|e| format!("Failed to attach RTT: {e}"))?;
+        let mut rtt = Rtt::attach_region(&mut core, &region)
+            .map_err(|e| format!("Failed to attach RTT: {e}"))?;
 
-    let channels: Vec<RttChannelInfo> = rtt
-        .up_channels()
-        .iter()
-        .map(|ch| RttChannelInfo {
-            number: ch.number(),
-            name: ch.name().map(String::from),
-            buffer_size: ch.buffer_size(),
-        })
-        .collect();
+        let channels: Vec<RttChannelInfo> = rtt
+            .up_channels()
+            .iter()
+            .map(|ch| RttChannelInfo {
+                number: ch.number(),
+                name: ch.name().map(String::from),
+                buffer_size: ch.buffer_size(),
+            })
+            .collect();
 
-    drop(core);
+        (rtt, channels)
+    }; // session lock released here
+
+    let cb_addr = format!("0x{:x}", rtt.ptr());
 
     *state.rtt.lock() = Some(RttState {
         rtt,
@@ -202,41 +218,59 @@ fn rtt_attach(
         down_channel: down_channel.unwrap_or(0),
     });
 
-    Ok(channels)
-}
+    // Start background reader thread
+    state.rtt_stop.store(false, Ordering::Relaxed);
+    let session_arc = state.session.clone();
+    let rtt_arc = state.rtt.clone();
+    let stop_flag = state.rtt_stop.clone();
 
-#[tauri::command]
-fn rtt_read(state: State<'_, AppState>) -> Result<Option<String>, String> {
-    let mut session_guard = state.session.lock();
-    let session = session_guard
-        .as_mut()
-        .ok_or("Not connected to a probe")?;
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 128];
+        loop {
+            if stop_flag.load(Ordering::Relaxed) {
+                break;
+            }
 
-    let mut rtt_guard = state.rtt.lock();
-    let rtt_state = rtt_guard.as_mut().ok_or("RTT not attached")?;
+            let data = {
+                let mut session_guard = session_arc.lock();
+                let mut rtt_guard = rtt_arc.lock();
 
-    let mut core = session
-        .core(0)
-        .map_err(|e| format!("Failed to get core: {e}"))?;
+                let Some(session) = session_guard.as_mut() else { break };
+                let Some(rtt_state) = rtt_guard.as_mut() else { break };
 
-    let mut buf = [0u8; 1024];
+                let Ok(mut core) = session.core(0) else { break };
+                let Some(up_ch) = rtt_state.rtt.up_channel(rtt_state.up_channel) else {
+                    break;
+                };
 
-    if let Some(up_ch) = rtt_state.rtt.up_channel(rtt_state.up_channel) {
-        let count = up_ch
-            .read(&mut core, &mut buf)
-            .map_err(|e| format!("RTT read error: {e}"))?;
+                let mut output = Vec::new();
+                loop {
+                    match up_ch.read(&mut core, &mut buf) {
+                        Ok(0) => break,
+                        Ok(count) => output.extend_from_slice(&buf[..count]),
+                        Err(_) => break,
+                    }
+                }
 
-        if count > 0 {
-            Ok(Some(String::from_utf8_lossy(&buf[..count]).to_string()))
-        } else {
-            Ok(None)
+                if output.is_empty() {
+                    None
+                } else {
+                    Some(String::from_utf8_lossy(&output).to_string())
+                }
+            }; // locks released here
+
+            if let Some(data) = data {
+                let _ = app.emit("rtt-data", data);
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
         }
-    } else {
-        Err(format!(
-            "Up channel {} not found",
-            rtt_state.up_channel
-        ))
-    }
+    });
+
+    Ok(RttAttachResult {
+        channels,
+        control_block_address: cb_addr,
+    })
 }
 
 #[tauri::command]
@@ -268,6 +302,7 @@ fn rtt_write(state: State<'_, AppState>, data: String) -> Result<usize, String> 
 
 #[tauri::command]
 fn rtt_detach(state: State<'_, AppState>) {
+    state.rtt_stop.store(true, Ordering::Relaxed);
     *state.rtt.lock() = None;
 }
 
@@ -327,7 +362,6 @@ pub fn run() {
             disconnect,
             flash_firmware,
             rtt_attach,
-            rtt_read,
             rtt_write,
             rtt_detach,
             reset_target,

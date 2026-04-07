@@ -1,5 +1,6 @@
 <script>
   import { invoke } from '@tauri-apps/api/core';
+  import { listen } from '@tauri-apps/api/event';
   import { Terminal } from '@xterm/xterm';
   import { FitAddon } from '@xterm/addon-fit';
   import '@xterm/xterm/css/xterm.css';
@@ -8,9 +9,9 @@
 
   let rttConnected = $state(false);
   let channels = $state([]);
-  let scanRegion = $state('');
-  let polling = $state(false);
-  let pollInterval = null;
+  let scanRegion = $state(localStorage.getItem('lastScanRegion') || '');
+  let fullscreen = $state(false);
+  let unlisten = null;
   let terminal = null;
   let fitAddon = null;
   let terminalEl = $state(null);
@@ -26,7 +27,7 @@
       fontSize: 13,
       lineHeight: 1.3,
       scrollback: 10000,
-      convertEol: false,
+      convertEol: true,
       theme: {
         background: '#1c1c1e',
         foreground: '#e5e5ea',
@@ -83,21 +84,28 @@
   async function attachRtt() {
     try {
       const region = scanRegion || undefined;
-      channels = await invoke('rtt_attach', { scanRegion: region });
+      const result = await invoke('rtt_attach', { scanRegion: region });
+      channels = result.channels;
       rttConnected = true;
-      onstatus?.({ detail: `RTT attached (${channels.length} channels)` });
+      localStorage.setItem('lastScanRegion', result.control_block_address);
+      onstatus?.({ detail: `RTT attached at ${result.control_block_address} (${channels.length} channels)` });
 
       // Wait a tick for the DOM to render, then init terminal
       await new Promise((r) => setTimeout(r, 0));
       initTerminal();
-      startPolling();
+      unlisten = await listen('rtt-data', (event) => {
+        terminal?.write(event.payload);
+      });
     } catch (e) {
       onstatus?.({ detail: `RTT attach error: ${e}` });
     }
   }
 
   async function detachRtt() {
-    stopPolling();
+    if (unlisten) {
+      unlisten();
+      unlisten = null;
+    }
     destroyTerminal();
     try {
       await invoke('rtt_detach');
@@ -109,38 +117,18 @@
     }
   }
 
-  function startPolling() {
-    if (polling) return;
-    polling = true;
-    pollInterval = setInterval(pollRtt, 50);
-  }
-
-  function stopPolling() {
-    polling = false;
-    if (pollInterval) {
-      clearInterval(pollInterval);
-      pollInterval = null;
-    }
-  }
-
-  async function pollRtt() {
-    try {
-      const data = await invoke('rtt_read');
-      if (data) {
-        terminal?.write(data);
-      }
-    } catch (e) {
-      stopPolling();
-      onstatus?.({ detail: `RTT read error: ${e}` });
-    }
-  }
-
   function clearTerminal() {
     terminal?.clear();
   }
+
+  function toggleFullscreen() {
+    fullscreen = !fullscreen;
+    // Refit after layout change
+    requestAnimationFrame(() => fitAddon?.fit());
+  }
 </script>
 
-<section class="panel" class:panel-grow={rttConnected}>
+<section class="panel" class:panel-grow={rttConnected} class:panel-fullscreen={fullscreen}>
   <h2>RTT Terminal</h2>
 
   {#if !rttConnected}
@@ -160,6 +148,7 @@
           {/each}
         </span>
         <div class="rtt-actions">
+          <button class="icon-btn" onclick={toggleFullscreen} title={fullscreen ? 'Exit Fullscreen' : 'Fullscreen'}>{fullscreen ? '⊡' : '⊞'}</button>
           <button class="icon-btn" onclick={clearTerminal} title="Clear">🗑</button>
           <button class="btn danger small" onclick={detachRtt}>Detach</button>
         </div>
@@ -184,6 +173,17 @@
     flex: 1;
     min-height: max(200px, 50vh);
     overflow: hidden;
+  }
+
+  .panel-fullscreen {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 1000;
+    border-radius: 0;
+    min-height: 100vh;
   }
 
   h2 {
@@ -274,32 +274,13 @@
     overflow: hidden;
     flex: 1;
     min-height: 0;
+    background-color: #1c1c1e;
   }
 
   .terminal-wrapper :global(.xterm) {
     padding: 10px;
     height: 100%;
-  }
-
-  .terminal-wrapper :global(.xterm-viewport) {
-    background-color: #1c1c1e !important;
-  }
-
-  .terminal-wrapper :global(.xterm-viewport::-webkit-scrollbar) {
-    width: 8px;
-  }
-
-  .terminal-wrapper :global(.xterm-viewport::-webkit-scrollbar-track) {
-    background: transparent;
-  }
-
-  .terminal-wrapper :global(.xterm-viewport::-webkit-scrollbar-thumb) {
-    background: rgba(255, 255, 255, 0.15);
-    border-radius: 4px;
-  }
-
-  .terminal-wrapper :global(.xterm-viewport::-webkit-scrollbar-thumb:hover) {
-    background: rgba(255, 255, 255, 0.25);
+    background-color: #1c1c1e;
   }
 
   .btn {
