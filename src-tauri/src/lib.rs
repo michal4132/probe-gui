@@ -61,6 +61,7 @@ pub struct FlashProgress {
 pub struct AppState {
     session: Arc<Mutex<Option<Session>>>,
     rtt: Arc<Mutex<Option<RttState>>>,
+    rtt_down_buffer: Arc<Mutex<Vec<u8>>>,
     rtt_stop: Arc<AtomicBool>,
 }
 
@@ -75,6 +76,7 @@ impl AppState {
         Self {
             session: Arc::new(Mutex::new(None)),
             rtt: Arc::new(Mutex::new(None)),
+            rtt_down_buffer: Arc::new(Mutex::new(Vec::new())),
             rtt_stop: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -138,19 +140,17 @@ fn connect(
 #[tauri::command]
 fn disconnect(state: State<'_, AppState>) {
     state.rtt_stop.store(true, Ordering::Relaxed);
-    *state.rtt.lock() = None;
-    *state.session.lock() = None;
+    let mut session_guard = state.session.lock();
+    let mut rtt_guard = state.rtt.lock();
+    state.rtt_down_buffer.lock().clear();
+    *rtt_guard = None;
+    *session_guard = None;
 }
 
 #[tauri::command]
-fn flash_firmware(
-    state: State<'_, AppState>,
-    path: String,
-) -> Result<String, String> {
+fn flash_firmware(state: State<'_, AppState>, path: String) -> Result<String, String> {
     let mut session_guard = state.session.lock();
-    let session = session_guard
-        .as_mut()
-        .ok_or("Not connected to a probe")?;
+    let session = session_guard.as_mut().ok_or("Not connected to a probe")?;
 
     let file_path = PathBuf::from(&path);
     if !file_path.exists() {
@@ -166,8 +166,7 @@ fn flash_firmware(
         .ok_or_else(|| format!("Unknown file format: {ext}"))?
         .create_loader(None);
 
-    download_file(session, &file_path, format)
-        .map_err(|e| format!("Flash failed: {e}"))?;
+    download_file(session, &file_path, format).map_err(|e| format!("Flash failed: {e}"))?;
 
     Ok(format!("Successfully flashed {path}"))
 }
@@ -182,11 +181,11 @@ fn rtt_attach(
 ) -> Result<RttAttachResult, String> {
     let (rtt, channels) = {
         let mut session_guard = state.session.lock();
-        let session = session_guard
-            .as_mut()
-            .ok_or("Not connected to a probe")?;
+        let session = session_guard.as_mut().ok_or("Not connected to a probe")?;
 
-        let mut core = session.core(0).map_err(|e| format!("Failed to get core: {e}"))?;
+        let mut core = session
+            .core(0)
+            .map_err(|e| format!("Failed to get core: {e}"))?;
 
         let region = if let Some(ref region_str) = scan_region {
             parse_scan_region(region_str).map_err(|e| format!("Invalid scan region: {e}"))?
@@ -217,11 +216,13 @@ fn rtt_attach(
         up_channel: up_channel.unwrap_or(0),
         down_channel: down_channel.unwrap_or(0),
     });
+    state.rtt_down_buffer.lock().clear();
 
-    // Start background reader thread
+    // Start background RTT thread.
     state.rtt_stop.store(false, Ordering::Relaxed);
     let session_arc = state.session.clone();
     let rtt_arc = state.rtt.clone();
+    let down_buffer_arc = state.rtt_down_buffer.clone();
     let stop_flag = state.rtt_stop.clone();
 
     std::thread::spawn(move || {
@@ -231,37 +232,71 @@ fn rtt_attach(
                 break;
             }
 
-            let data = {
+            let (data, wrote_down) = {
                 let mut session_guard = session_arc.lock();
                 let mut rtt_guard = rtt_arc.lock();
 
-                let Some(session) = session_guard.as_mut() else { break };
-                let Some(rtt_state) = rtt_guard.as_mut() else { break };
-
-                let Ok(mut core) = session.core(0) else { break };
-                let Some(up_ch) = rtt_state.rtt.up_channel(rtt_state.up_channel) else {
+                let Some(session) = session_guard.as_mut() else {
+                    break;
+                };
+                let Some(rtt_state) = rtt_guard.as_mut() else {
                     break;
                 };
 
+                let Ok(mut core) = session.core(0) else { break };
+
                 let mut output = Vec::new();
-                loop {
-                    match up_ch.read(&mut core, &mut buf) {
-                        Ok(0) => break,
-                        Ok(count) => output.extend_from_slice(&buf[..count]),
-                        Err(_) => break,
+                {
+                    let Some(up_ch) = rtt_state.rtt.up_channel(rtt_state.up_channel) else {
+                        break;
+                    };
+
+                    loop {
+                        match up_ch.read(&mut core, &mut buf) {
+                            Ok(0) => break,
+                            Ok(count) => output.extend_from_slice(&buf[..count]),
+                            Err(_) => break,
+                        }
                     }
                 }
 
-                if output.is_empty() {
+                let wrote_down = {
+                    let mut down_buffer = down_buffer_arc.lock();
+                    if down_buffer.is_empty() {
+                        false
+                    } else {
+                        let Some(down_ch) = rtt_state.rtt.down_channel(rtt_state.down_channel)
+                        else {
+                            break;
+                        };
+
+                        match down_ch.write(&mut core, down_buffer.as_slice()) {
+                            Ok(0) => false,
+                            Ok(count) => {
+                                down_buffer.drain(..count);
+                                true
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                };
+
+                let data = if output.is_empty() {
                     None
                 } else {
                     Some(String::from_utf8_lossy(&output).to_string())
-                }
+                };
+
+                (data, wrote_down)
             }; // locks released here
+
+            let should_sleep = data.is_none() && !wrote_down;
 
             if let Some(data) = data {
                 let _ = app.emit("rtt-data", data);
-            } else {
+            }
+
+            if should_sleep {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
@@ -275,43 +310,37 @@ fn rtt_attach(
 
 #[tauri::command]
 fn rtt_write(state: State<'_, AppState>, data: String) -> Result<usize, String> {
-    let mut session_guard = state.session.lock();
-    let session = session_guard
-        .as_mut()
-        .ok_or("Not connected to a probe")?;
+    let session_guard = state.session.lock();
+    if session_guard.is_none() {
+        return Err("Not connected to a probe".into());
+    }
 
     let mut rtt_guard = state.rtt.lock();
     let rtt_state = rtt_guard.as_mut().ok_or("RTT not attached")?;
 
-    let mut core = session
-        .core(0)
-        .map_err(|e| format!("Failed to get core: {e}"))?;
-
-    if let Some(down_ch) = rtt_state.rtt.down_channel(rtt_state.down_channel) {
-        let count = down_ch
-            .write(&mut core, data.as_bytes())
-            .map_err(|e| format!("RTT write error: {e}"))?;
-        Ok(count)
-    } else {
-        Err(format!(
-            "Down channel {} not found",
-            rtt_state.down_channel
-        ))
+    if rtt_state.rtt.down_channel(rtt_state.down_channel).is_none() {
+        return Err(format!("Down channel {} not found", rtt_state.down_channel));
     }
+
+    let bytes = data.into_bytes();
+    let count = bytes.len();
+    state.rtt_down_buffer.lock().extend_from_slice(&bytes);
+
+    Ok(count)
 }
 
 #[tauri::command]
 fn rtt_detach(state: State<'_, AppState>) {
     state.rtt_stop.store(true, Ordering::Relaxed);
-    *state.rtt.lock() = None;
+    let mut rtt_guard = state.rtt.lock();
+    state.rtt_down_buffer.lock().clear();
+    *rtt_guard = None;
 }
 
 #[tauri::command]
 fn reset_target(state: State<'_, AppState>) -> Result<(), String> {
     let mut session_guard = state.session.lock();
-    let session = session_guard
-        .as_mut()
-        .ok_or("Not connected to a probe")?;
+    let session = session_guard.as_mut().ok_or("Not connected to a probe")?;
 
     let mut core = session
         .core(0)
